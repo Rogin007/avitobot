@@ -88,11 +88,20 @@ def make_rf_url(url: str) -> str:
 
 
 class AvitoFetcher:
-    """Async network layer with retries, UA rotation and proxies."""
+    """Async network layer with retries, UA rotation and proxies.
+
+    A single :class:`curl_cffi AsyncSession` is reused across requests so the
+    cookies Avito sets on the first successful response (ACN, uid, etc.) are
+    retained — this makes the visitor look like an established human browser
+    instead of a cold scraping bot. A short random pause runs before every
+    request so bursts of monitored URLs don't trip the rate limiter.
+    """
 
     def __init__(self, cfg: cfg_mod.Config):
         self._cfg = cfg
         self._ua_index = 0
+        self._session: Optional["object"] = None
+        self._session_lock = asyncio.Lock()
 
     def _next_headers(self) -> dict:
         headers = dict(self._cfg.request_headers)
@@ -102,6 +111,37 @@ class AvitoFetcher:
             ]
             self._ua_index += 1
         return headers
+
+    async def _request_kwargs(self) -> dict:
+        kwargs: dict = {
+            "headers": self._next_headers(),
+            "impersonate": self._cfg.impersonate,
+            "timeout": self._cfg.timeout_seconds,
+            "allow_redirects": True,
+        }
+        if self._cfg.proxies:
+            # curl_cffi accepts a single proxy; prefer https/http separately.
+            proxy = self._cfg.proxies.get("https") or self._cfg.proxies.get("http")
+            if proxy:
+                kwargs["proxies"] = {"http": proxy, "https": proxy}
+        return kwargs
+
+    async def _get_session(self):
+        """Return the shared persistent session, creating it once."""
+        async with self._session_lock:
+            if self._session is None:
+                from curl_cffi import requests
+                self._session = requests.AsyncSession(
+                    impersonate=self._cfg.impersonate,
+                    timeout=self._cfg.timeout_seconds,
+                )
+            return self._session
+
+    async def _polite_delay(self) -> None:
+        """Random human-ish pause before hitting the server."""
+        lo, hi = self._cfg.min_request_delay, self._cfg.max_request_delay
+        if hi > 0:
+            await asyncio.sleep(max(0.0, __import__("random").uniform(min(lo, hi), max(lo, hi))))
 
     async def fetch(self, url: str) -> str:
         """Fetch HTML with retries. Raises CaptchaError/NetworkError."""
@@ -120,36 +160,45 @@ class AvitoFetcher:
             except NetworkError as exc:
                 last = exc
                 log.warning("network error fetching %s: %s", url, exc)
-            await asyncio.sleep(1 + attempt * 1.5)
+            # randomized backoff (never penalizes on instant success)
+            import random
+            await asyncio.sleep(random.uniform(1.5, 3.5) * (attempt + 1))
         raise NetworkError(f"failed after {self._cfg.retries} retries: {url}") from last
 
     async def _fetch_once(self, url: str) -> str:
         from curl_cffi import requests
 
-        kwargs: dict = {
-            "headers": self._next_headers(),
-            "impersonate": self._cfg.impersonate,
-            "timeout": self._cfg.timeout_seconds,
-            "allow_redirects": True,
-        }
-        if self._cfg.proxies:
-            # curl_cffi accepts a single proxy; prefer https/http separately.
-            proxy = self._cfg.proxies.get("https") or self._cfg.proxies.get("http")
-            if proxy:
-                kwargs["proxies"] = {"http": proxy, "https": proxy}
+        await self._polite_delay()
+        session = await self._get_session()
+        kwargs = await self._request_kwargs()
 
-        async with requests.AsyncSession() as session:
-            resp = await session.get(url, **kwargs)
+        resp = await session.get(url, **kwargs)
 
         status = resp.status_code
         body = resp.text if isinstance(resp.text, str) else resp.content
         body = body if isinstance(body, bytes) else body.encode("utf-8", "ignore")
         log.debug("got HTTP %s, %s bytes from %s", status, len(body), url)
         if status == 403 or _looks_like_captcha(body):
+            # after a captcha the session cookie lens is suspect: drop it so the
+            # next cycle starts clean instead of inheriting a poisoned identity
+            await self._reset_session()
             raise CaptchaError(f"captcha/forbidden (HTTP {status}) for {url}")
         if status >= 400:
             raise NetworkError(f"HTTP {status} for {url}")
         return resp.text if isinstance(resp.text, str) else resp.text.decode(resp.encoding or "utf-8", "ignore")
+
+    async def _reset_session(self) -> None:
+        """Close and drop the shared session (recreated on next request)."""
+        async with self._session_lock:
+            if self._session is not None:
+                try:
+                    await self._session.close()
+                except Exception:
+                    log.exception("closing curl session failed")
+                self._session = None
+
+    async def close(self) -> None:
+        await self._reset_session()
 
 
 def _looks_like_captcha(body: bytes) -> bool:

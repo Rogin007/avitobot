@@ -49,6 +49,8 @@ class Config:
     impersonate: str = "chrome124"
     timeout_seconds: float = 20.0
     retries: int = 3
+    min_request_delay: float = 1.0   # polite random pause before each request
+    max_request_delay: float = 3.0   # keeps bursts of URLs human-like
     proxies: Optional[dict] = None   # e.g. {"http": "...", "https": "..."}
 
     # --- Monitored search links (Ekb by default) ---
@@ -160,6 +162,8 @@ def load_config() -> Config:
         impersonate=os.getenv("AVITO_IMPERSONATE", "chrome124"),
         timeout_seconds=_env_float(os.getenv("AVITO_TIMEOUT", "20.0")),
         retries=_env_int("AVITO_RETRIES", 3),
+        min_request_delay=_env_float(os.getenv("AVITO_REQUEST_DELAY_MIN", "1.0")),
+        max_request_delay=_env_float(os.getenv("AVITO_REQUEST_DELAY_MAX", "3.0")),
         proxies=parse_proxy(os.getenv("AVITO_PROXY")),
         db_path=os.getenv("AVITO_DB_PATH", "avito.db"),
         user_agents=_user_agents(),

@@ -47,6 +47,11 @@ class Monitor:
         """Request the monitor loop to exit after the current cycle/delay."""
         self._stop_event.set()
 
+    async def close(self) -> None:
+        """Release the shared HTTP session (curl cookie jar includes it)."""
+        with contextlib.suppress(Exception):
+            await self._fetcher.close()
+
     async def detect_new(self, url: str) -> list[tuple[Listing, NormalizedLot]]:
         """Fetch a search page, normalize items, drop already-seen ids."""
         html = await self._fetcher.fetch(url)
@@ -253,6 +258,8 @@ class AvitoBot:
                 *(polling_task,) if polling_task else (),
             )
             log.info("stopped gracefully")
+            with contextlib.suppress(Exception):
+                await self._monitor.close()
 
     async def _connect_telegram(
         self, shutdown_waiter: asyncio.Future
