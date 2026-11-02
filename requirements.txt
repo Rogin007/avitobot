@@ -1,0 +1,5 @@
+aiogram>=3.7,<4
+curl_cffi>=0.7
+aiosqlite>=0.20
+beautifulsoup4>=4.12
+lxml>=5.0
